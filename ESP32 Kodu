@@ -1,111 +1,254 @@
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include "mbedtls/aes.h" // ESP32'nin donanımsal AES kütüphanesi
+// ==========================
+// GEREKLİ KÜTÜPHANELER
+// ==========================
+#include <WiFi.h>              // ESP32'nin WiFi ile internete bağlanmasını sağlar
+#include <PubSubClient.h>      // MQTT protokolü ile haberleşmeyi sağlar
+#include "mbedtls/aes.h"       // AES şifreleme ve çözme işlemleri için kullanılır
 
-// ==========================================
-// 1. BLOK: GİRİŞ VE BAĞLANTI AYARLARI
-// ==========================================
-const char* ssid = "Wokwi-GUEST";       // Sanal ağ adı
-const char* password = "";              // Sanal ağ şifresi
-const char* mqtt_server = "broker.hivemq.com"; // Ücretsiz mesaj sunucusu
-const char* topic = "dogukan/proje/ledkontrol"; // Haberleşme kanalı
-const int ledPin = 26;                  // LED'in bağlı olduğu fiziksel pin
+// ==========================
+// WIFI VE MQTT AYARLARI
+// ==========================
+const char* ssid = "Wokwi-GUEST";           // Bağlanılacak WiFi adı
+const char* password = "";                  // WiFi şifresi (Wokwi'de boş)
+const char* mqtt_server = "broker.hivemq.com"; // MQTT broker adresi
+const char* topic = "dogukan/proje/ledkontrol"; // MQTT topic (kanal)
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+const int ledPin = 26;   // LED'in bağlı olduğu pin (GPIO2)
 
-// 128-bit Güvenlik Anahtarı (Kilit ve Anahtarın eşleşmesi şart)
-unsigned char aes_key[] = "KIRIKKALE_UNI_16"; 
+// ==========================
+// MQTT İÇİN NESNELER
+// ==========================
+WiFiClient espClient;              // WiFi bağlantı nesnesi
+PubSubClient client(espClient);    // MQTT istemcisi (WiFi üzerinden çalışır)
 
-// ==========================================
-// 2. BLOK: DÖNÜŞTÜRME (HEX TO BYTE)
-// ==========================================
-// İnternetten gelen "A1" gibi metinleri, sayısal verilere çevirir
+// ==========================
+// AES ANAHTARI (128 BIT = 16 BYTE)
+// ==========================
+unsigned char aes_key[16] = {
+  'K','I','R','I','K','K','A','L',
+  'E','_','U','N','I','_','1','6'
+};
+// Bu anahtar hem şifreleme hem çözme işlemlerinde kullanılır
+
+// ==========================
+// HEX KARAKTERİ SAYIYA ÇEVİRİR
+// ==========================
 byte charToHex(char c) {
+  // Eğer karakter 0-9 arasındaysa
   if (c >= '0' && c <= '9') return c - '0';
+
+  // Eğer karakter a-f arasındaysa
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+
+  // Eğer karakter A-F arasındaysa
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return 0;
+
+  return 0; // Geçersiz karakter
 }
 
+// ==========================
+// HEX STRING → BYTE DİZİSİ
+// ==========================
 void hexToBytes(const char* hex, unsigned char* bytes) {
+
+  // 16 byte veri üretilecek (AES block size)
   for (int i = 0; i < 16; i++) {
+
+    // 2 karakter → 1 byte
+    // Örn: "4F" → 0x4F
     bytes[i] = (charToHex(hex[2 * i]) << 4) | charToHex(hex[2 * i + 1]);
   }
 }
 
-// ==========================================
-// 3. BLOK: KRİPTOGRAFİ (ŞİFRE ÇÖZME)
-// ==========================================
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.println("\n--- YENI PAKET GELDI ---");
-  
-  // Gelen şifreli metni hafızaya al
-  char hexStr[33];
-  for (int i = 0; i < length && i < 32; i++) {
-    hexStr[i] = (char)payload[i];
-  }
-  hexStr[length] = '\0';
+// ==========================
+// TELEFON İÇİN ŞİFRE ÜRETME
+// ==========================
+void printEncryptedHex(const char* message) {
 
-  // Adım 1: Metni sayısal byte paketine dönüştür
+  // 16 byte'lık veri oluşturulur (AES blok boyutu)
+  unsigned char plainText[16] = {0};
+
+  // Mesaj buraya kopyalanır (örn: "ON")
+  strcpy((char*)plainText, message);
+
+  // Şifreli veri burada tutulacak
+  unsigned char cipherText[16];
+
+  // AES nesnesi oluştur
+  mbedtls_aes_context aes;
+
+  // AES başlat
+  mbedtls_aes_init(&aes);
+
+  // AES şifreleme anahtarını ayarla
+  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+
+  // AES şifreleme işlemi (ECB modu)
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plainText, cipherText);
+
+  // AES nesnesini temizle
+  mbedtls_aes_free(&aes);
+
+  // Şifreli veriyi HEX olarak yazdır
+  Serial.print("Telefonda '");
+  Serial.print(message);
+  Serial.print("' icin PAYLOAD: ");
+
+  for (int i = 0; i < 16; i++) {
+
+    // Eğer byte 1 haneliyse başına 0 koy
+    if (cipherText[i] < 16) Serial.print("0");
+
+    // HEX olarak yazdır
+    Serial.print(cipherText[i], HEX);
+  }
+
+  Serial.println(); // yeni satır
+}
+
+// ==========================
+// MQTT MESAJ GELİNCE ÇALIŞIR
+// ==========================
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  Serial.println("\n--- SIFRELI MESAJ GELDI ---");
+
+  // Gelen veriyi string'e çevir
+  char hexStr[33];
+
+  // Güvenli uzunluk (max 32 karakter)
+  int safeLen = (length < 32) ? length : 32;
+
+  for (int i = 0; i < safeLen; i++) {
+    hexStr[i] = (char)payload[i];  // byte → char dönüşümü
+    Serial.print((char)payload[i]); // ekrana yazdır
+  }
+
+  hexStr[safeLen] = '\0'; // string sonlandır
+
+  Serial.println(" (Sifreli veri)");
+
+  // ==========================
+  // HEX → BYTE
+  // ==========================
   unsigned char cipherText[16];
   hexToBytes(hexStr, cipherText);
 
-  // Adım 2: AES Motorunu başlat ve şifreyi çöz
-  unsigned char plainText[16];
+  // ==========================
+  // AES ÇÖZME
+  // ==========================
+  unsigned char plainText[16] = {0};
+
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_dec(&aes, aes_key, 128); // "Çözme" modunda anahtarı tanıt
-  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, cipherText, plainText); // Kilidi aç!
+
+  // AES çözme anahtarı ayarlanır
+  mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+
+  // Şifre çözme işlemi
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, cipherText, plainText);
+
   mbedtls_aes_free(&aes);
 
-  // ==========================================
-  // 4. BLOK: KARAR VE MANTIK
-  // ==========================================
+  // ==========================
+  // SONUCU STRING YAP
+  // ==========================
   String decryptedMessage = String((char*)plainText);
-  Serial.print("Sifre Cozuldu! Komut: ");
+
+  Serial.print("Cozulmus komut: ");
   Serial.println(decryptedMessage);
 
-  // Çözülen metin gerçek bir komut mu?
+  // ==========================
+  // LED KONTROL
+  // ==========================
   if (decryptedMessage.startsWith("ON")) {
-    digitalWrite(ledPin, HIGH); // 5. BLOK: DONANIMI ÇALIŞTIR
-    Serial.println("ISLEM: LED ACILDI");
+
+    digitalWrite(ledPin, HIGH);   // LED yak
+    Serial.println("LED ACILDI");
+
   } 
   else if (decryptedMessage.startsWith("OFF")) {
-    digitalWrite(ledPin, LOW);  // 5. BLOK: DONANIMI DURDUR
-    Serial.println("ISLEM: LED KAPANDI");
+
+    digitalWrite(ledPin, LOW);    // LED söndür
+    Serial.println("LED KAPANDI");
+
+  } 
+  else {
+    Serial.println("Gecersiz komut!");
   }
 }
 
-// ==========================================
-// SİSTEM KURULUM VE DÖNGÜ (SETUP & LOOP)
-// ==========================================
+// ==========================
+// MQTT YENİDEN BAĞLANMA
+// ==========================
+void reconnect() {
+
+  while (!client.connected()) {
+
+    Serial.print("MQTT baglaniliyor...");
+
+    // Benzersiz client ID
+    String clientId = "ESP32-" + String(random(0xffff), HEX);
+
+    // Bağlantı denemesi
+    if (client.connect(clientId.c_str())) {
+
+      Serial.println(" Baglandi!");
+
+      // Topic'e abone ol
+      client.subscribe(topic);
+
+    } else {
+
+      Serial.println(" Baglanti basarisiz!");
+      delay(5000);
+    }
+  }
+}
+
+// ==========================
+// SETUP
+// ==========================
 void setup() {
-  Serial.begin(115200);
-  pinMode(ledPin, OUTPUT);
-  
+
+  Serial.begin(115200);        // Serial başlat
+  pinMode(ledPin, OUTPUT);     // LED çıkış olarak ayarla
+  digitalWrite(ledPin, LOW);   // LED başlangıçta kapalı
+
+  // WiFi bağlantısı başlat
   WiFi.begin(ssid, password);
+
+  Serial.print("WiFi baglaniliyor");
+
+  // Bağlanana kadar bekle
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi Baglantisi Basarili!");
 
+  Serial.println("\nWiFi baglandi!");
+
+  // Telefon için gerekli şifreleri yazdır
+  Serial.println("\n--- TELEFON ICIN ---");
+  printEncryptedHex("ON");
+  printEncryptedHex("OFF");
+  Serial.println("-------------------");
+
+  // MQTT ayarları
   client.setServer(mqtt_server, 1883);
-  client.setCallback(callback); // Mesaj geldiğinde callback fonksiyonuna git
+  client.setCallback(callback);
 }
 
+// ==========================
+// LOOP
+// ==========================
 void loop() {
-  // Bağlantı koparsa otomatik olarak tekrar bağlan
+
+  // MQTT bağlı değilse tekrar bağlan
   if (!client.connected()) {
-    while (!client.connected()) {
-      String clientId = "ESP32-" + String(random(0xffff), HEX);
-      if (client.connect(clientId.c_str())) {
-        client.subscribe(topic); // Kanala tekrar abone ol
-      } else {
-        delay(5000);
-      }
-    }
+    reconnect();
   }
-  client.loop(); // Arka planda gelen mesajları dinlemeye devam et
+
+  // MQTT mesajlarını dinle
+  client.loop();
 }
