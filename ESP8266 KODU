@@ -1,0 +1,276 @@
+/****************************************************
+   MQTT + AES Tabanlı Güvenli IoT Haberleşme Sistemi
+   Kart: ESP8266 (NodeMCU / CH340G V3)
+
+   Bu kod ne yapar?
+   1. Wi-Fi'ye bağlanır
+   2. MQTT broker'a bağlanır
+   3. Test verisi üretir (sicaklik ve nem gibi)
+   4. Veriyi AES ile şifreler
+   5. Şifreli veriyi MQTT topic'ine gönderir
+   6. MQTT üzerinden gelen şifreli ON/OFF komutunu çözer
+   7. LED'i açar veya kapatır
+****************************************************/
+
+#include <ESP8266WiFi.h>     // ESP8266'nın Wi-Fi işlemleri için
+#include <PubSubClient.h>    // MQTT haberleşmesi için
+#include <AESLib.h>          // AES şifreleme için
+
+/*************** Wi-Fi Bilgileri ***************/
+// Buraya kendi modem adını ve şifreni yaz
+const char* ssid = "WIFI_ADIN";
+const char* password = "WIFI_SIFREN";
+
+/*************** MQTT Ayarları ***************/
+// Public broker kullanıyoruz
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+// Topic isimlerini benzersiz yapman daha iyi olur
+const char* topic_data = "dogukankaya/mqttaes/data";   // Şifreli veri burada yayınlanır
+const char* topic_cmd  = "dogukankaya/mqttaes/cmd";    // Şifreli ON/OFF komutu buradan alınır
+
+/*************** LED Pin ***************/
+// ESP8266 kartlarda genelde D4 dahili LED'e bağlıdır
+// Çoğu kartta ters mantık vardır:
+// LOW  -> LED yanar
+// HIGH -> LED söner
+#define LED_PIN D4
+
+/*************** Nesneler ***************/
+WiFiClient espClient;              // Wi-Fi istemcisi
+PubSubClient client(espClient);    // MQTT istemcisi
+AESLib aesLib;                     // AES işlemleri için nesne
+
+/*************** AES Anahtarı ve IV ***************/
+// AES-128 için 16 byte anahtar gerekir
+// Eğitim projesi için sabit anahtar ve sabit IV kullanıyoruz
+// Gerçek sistemlerde IV sabit olmaz
+byte aes_key[] = "1234567890ABCDEF";   // 16 byte key
+byte aes_iv[16] = "ABCDEF1234567890";  // 16 byte IV
+
+unsigned long lastPublish = 0;         // Son veri gönderim zamanını tutar
+
+/****************************************************
+   setupWifi()
+   Amaç: ESP8266'yı Wi-Fi ağına bağlamak
+****************************************************/
+void setupWifi() {
+  Serial.println();
+  Serial.println("Wi-Fi baglantisi baslatiliyor...");
+
+  WiFi.begin(ssid, password);
+
+  // Wi-Fi bağlanana kadar bekle
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("Wi-Fi baglandi.");
+  Serial.print("IP Adresi: ");
+  Serial.println(WiFi.localIP());
+}
+
+/****************************************************
+   encryptMessage()
+   Amaç: Düz metni AES ile şifrelemek
+   Girdi: plainText -> normal okunabilir veri
+   Çıktı: base64 formatında şifreli metin
+****************************************************/
+String encryptMessage(String plainText) {
+  // String'i char dizisine çevirmek için uzunluk hesaplanır
+  int plainLength = plainText.length() + 1;
+
+  char plainBuffer[plainLength];
+  plainText.toCharArray(plainBuffer, plainLength);
+
+  // AESLib şifreli verinin base64 boyutunu hesaplar
+  int cipherLength = aesLib.get_cipher64_length(plainLength);
+  char cipherBuffer[cipherLength];
+
+  // IV her işlemden önce tekrar kopyalanmalı
+  byte iv[16];
+  memcpy(iv, aes_iv, 16);
+
+  // Şifreleme yapılır
+  aesLib.encrypt64(
+    (byte*)plainBuffer,    // şifrelenecek veri
+    plainLength,           // veri uzunluğu
+    cipherBuffer,          // çıktı buffer'ı
+    aes_key,               // anahtar
+    sizeof(aes_key),       // anahtar uzunluğu
+    iv                     // IV
+  );
+
+  return String(cipherBuffer);
+}
+
+/****************************************************
+   decryptMessage()
+   Amaç: Gelen şifreli veriyi çözmek
+   Girdi: encryptedText -> base64 şifreli metin
+   Çıktı: çözülmüş düz metin
+****************************************************/
+String decryptMessage(String encryptedText) {
+  int encLength = encryptedText.length() + 1;
+
+  char encBuffer[encLength];
+  encryptedText.toCharArray(encBuffer, encLength);
+
+  // Çözülen veri burada tutulur
+  char plainBuffer[128];
+
+  // IV tekrar kopyalanır
+  byte iv[16];
+  memcpy(iv, aes_iv, 16);
+
+  // Şifre çözme yapılır
+  aesLib.decrypt64(
+    encBuffer,             // gelen şifreli metin
+    strlen(encBuffer),     // uzunluk
+    (byte*)plainBuffer,    // çözülmüş veri buraya yazılır
+    aes_key,               // anahtar
+    sizeof(aes_key),       // anahtar uzunluğu
+    iv                     // IV
+  );
+
+  return String(plainBuffer);
+}
+
+/****************************************************
+   callback()
+   Amaç: MQTT üzerinden gelen mesajları işlemek
+   Burada gelen veri şifreli ON/OFF komutudur
+****************************************************/
+void callback(char* topic, byte* payload, unsigned int length) {
+  String incoming = "";
+
+  // Byte dizisini String haline çevir
+  for (unsigned int i = 0; i < length; i++) {
+    incoming += (char)payload[i];
+  }
+
+  Serial.println("=================================");
+  Serial.print("Gelen topic: ");
+  Serial.println(topic);
+
+  Serial.print("Gelen sifreli veri: ");
+  Serial.println(incoming);
+
+  // Gelen şifreli komutu çöz
+  String decrypted = decryptMessage(incoming);
+
+  Serial.print("Cozulmus komut: ");
+  Serial.println(decrypted);
+
+  // Eğer komut topic'inden geldiyse komutu uygula
+  if (String(topic) == topic_cmd) {
+    if (decrypted == "ON") {
+      digitalWrite(LED_PIN, LOW);   // Dahili LED için LOW = ON
+      Serial.println("LED ACILDI");
+    }
+    else if (decrypted == "OFF") {
+      digitalWrite(LED_PIN, HIGH);  // HIGH = OFF
+      Serial.println("LED KAPANDI");
+    }
+    else {
+      Serial.println("Bilinmeyen komut geldi.");
+    }
+  }
+}
+
+/****************************************************
+   reconnectMQTT()
+   Amaç: MQTT bağlantısı koparsa tekrar bağlanmak
+****************************************************/
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("MQTT baglantisi kuruluyor... ");
+
+    // Her cihaz için benzersiz bir istemci adı oluşturmak iyi olur
+    String clientId = "ESP8266Client-";
+    clientId += String(ESP.getChipId(), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("BAGLANDI");
+
+      // Komut topic'ine abone ol
+      client.subscribe(topic_cmd);
+
+      Serial.print("Subscribe olundu: ");
+      Serial.println(topic_cmd);
+    } else {
+      Serial.print("Baglanti hatasi. Durum kodu: ");
+      Serial.println(client.state());
+      Serial.println("2 saniye sonra tekrar denenecek...");
+      delay(2000);
+    }
+  }
+}
+
+/****************************************************
+   setup()
+   Program ilk açıldığında bir kez çalışır
+****************************************************/
+void setup() {
+  Serial.begin(115200);      // Seri haberleşmeyi başlat
+  pinMode(LED_PIN, OUTPUT);  // LED pinini çıkış yap
+
+  // Başlangıçta LED kapalı olsun
+  digitalWrite(LED_PIN, HIGH);
+
+  setupWifi();                       // Wi-Fi'ye bağlan
+  client.setServer(mqtt_server, mqtt_port);  // MQTT sunucusunu ayarla
+  client.setCallback(callback);      // Gelen mesaj olduğunda callback çalışsın
+
+  Serial.println("Sistem hazir.");
+}
+
+/****************************************************
+   loop()
+   Sürekli çalışan ana döngü
+****************************************************/
+void loop() {
+  // MQTT bağlantısı yoksa yeniden bağlan
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+
+  // MQTT işlemlerinin düzgün çalışması için sürekli çağrılmalı
+  client.loop();
+
+  unsigned long now = millis();
+
+  // Her 5 saniyede bir veri gönder
+  if (now - lastPublish > 5000) {
+    lastPublish = now;
+
+    // Test verisi üretiyoruz
+    // İstersen buraya gerçek sensör kodu ekleyebilirsin
+    int sicaklik = random(22, 30);
+    int nem = random(40, 70);
+
+    // Düz veri metni hazırlanır
+    String plainData = "sicaklik=" + String(sicaklik) + ",nem=" + String(nem);
+
+    Serial.println("=================================");
+    Serial.print("Duz veri: ");
+    Serial.println(plainData);
+
+    // Veri şifrelenir
+    String encryptedData = encryptMessage(plainData);
+
+    Serial.print("Sifreli veri: ");
+    Serial.println(encryptedData);
+
+    // Şifreli veri MQTT ile yayınlanır
+    client.publish(topic_data, encryptedData.c_str());
+
+    Serial.print("Publish edilen topic: ");
+    Serial.println(topic_data);
+
+    Serial.println("Veri gonderildi.");
+  }
+}
